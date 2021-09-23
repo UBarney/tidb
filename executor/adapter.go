@@ -409,6 +409,11 @@ func (a *ExecStmt) Exec(ctx context.Context) (_ sqlexec.RecordSet, err error) {
 	}
 
 	if handled, result, err := a.handleNoDelay(ctx, e, isPessimistic); handled {
+		log.Info(
+			"handleNoDelay",
+			zap.String("query", a.Text),
+			zap.String("trackerDetach", ""),
+		)
 		return result, err
 	}
 
@@ -431,10 +436,10 @@ func (a *ExecStmt) Exec(ctx context.Context) (_ sqlexec.RecordSet, err error) {
 func (a *ExecStmt) handleNoDelay(ctx context.Context, e Executor, isPessimistic bool) (handled bool, rs sqlexec.RecordSet, err error) {
 	sc := a.Ctx.GetSessionVars().StmtCtx
 	defer func() {
-		// If the stmt have no rs like `insert`, The session tracker detachment will be directly
+		// If the stmt have been handled like `insert`, The session tracker detachment will be directly
 		// done in the `defer` function. If the rs is not nil, the detachment will be done in
 		// `rs.Close` in `handleStmt`
-		if sc != nil && rs == nil {
+		if sc != nil && handled {
 			if sc.MemTracker != nil {
 				sc.MemTracker.DetachFromGlobalTracker()
 			}
@@ -578,10 +583,12 @@ func (a *ExecStmt) handleNoDelayExecutor(ctx context.Context, e Executor) (sqlex
 		}
 	}
 
+	// 驱动 UpdateExec, InsertExec 执行
 	err = Next(ctx, e, newFirstChunk(e))
 	if err != nil {
 		return nil, err
 	}
+	log.Info("insert done!", zap.String("query", a.Text))
 	return nil, err
 }
 

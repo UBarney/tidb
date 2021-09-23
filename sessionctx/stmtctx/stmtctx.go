@@ -309,6 +309,7 @@ func (sc *StatementContext) GetPlanHint() (string, bool) {
 // InitDiskTracker initializes the sc.DiskTracker, use cache to avoid allocation.
 func (sc *StatementContext) InitDiskTracker(label int, bytesLimit int64) {
 	memory.InitTracker(&sc.cache.DiskTracker, label, bytesLimit, &sc.cache.LogOnExceed[0])
+	// 一直被 currentSession 持有 ?
 	sc.DiskTracker = &sc.cache.DiskTracker
 }
 

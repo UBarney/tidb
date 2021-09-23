@@ -22,6 +22,7 @@ import (
 
 	"github.com/cznic/mathutil"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/expression"
 	plannercore "github.com/pingcap/tidb/planner/core"
@@ -90,6 +91,16 @@ func (e *SortExec) Open(ctx context.Context) error {
 	if e.memTracker == nil {
 		e.memTracker = memory.NewTracker(e.id, -1)
 		e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
+		// 从 SessionVars 中拿到的 MemTracker 中, 没关联到 globalDiskTracker
+		// 但在 ResetContextOfStmt 中, 会将 GlobalDiskTracker 关联到 session 中的 Tracker; Reset 这步没啥问题
+		// 拿到的 session 没有 Reset 过 ?
+		//		通过 stacktrace 分析下, 拿到的 sessionCtx 是哪来的?
+		//
+		// DiskTracker 中的被 overwrite ?
+		//		观察谁会改
+
+		// 看下在一个 conn 中 session 的生命周期 ?
+
 		e.diskTracker = memory.NewTracker(e.id, -1)
 		e.diskTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.DiskTracker)
 	}
@@ -204,6 +215,9 @@ func (e *SortExec) externalSorting(req *chunk.Chunk) (err error) {
 }
 
 func (e *SortExec) fetchRowChunks(ctx context.Context) error {
+	log.Info("fetchRowChunking....")
+	defer log.Info("fetchRowChunk is DONE!")
+
 	fields := retTypes(e)
 	byItemsDesc := make([]bool, len(e.ByItems))
 	for i, byItem := range e.ByItems {
