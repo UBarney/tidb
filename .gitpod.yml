@@ -7,7 +7,7 @@ tasks:
   #   init: cp /workspace/.ssh/* /home/gitpod/.ssh/
 
   - name: installFZF
-    init: git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf && ~/.fzf/install
+    init: git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf && ~/.fzf/install --all
 
   - name: "installMysqlClient"
     command: sudo apt update && sudo apt install -y mysql-client
