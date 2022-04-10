@@ -14,7 +14,7 @@ tasks:
 
   - init: make server
   
-  - init: make test
+  - init: make test -j 2
 
 vscode:
   extensions:
