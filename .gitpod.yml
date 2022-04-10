@@ -3,9 +3,6 @@
 # and commit this file to your remote git repository to share the goodness with others.
 
 tasks:
-  # - name: setUpGithubSSH
-  #   init: cp /workspace/.ssh/* /home/gitpod/.ssh/
-
   - name: installFZF
     init: git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf && ~/.fzf/install --all
 
@@ -14,7 +11,7 @@ tasks:
 
   - init: make server
   
-  - init: make test -j 2
+
 
 vscode:
   extensions:
