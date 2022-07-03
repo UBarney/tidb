@@ -312,7 +312,7 @@ func (p *PhysicalTableScan) isFullScan() bool {
 	var unsignedIntHandle bool
 	if p.Table.PKIsHandle {
 		if pkColInfo := p.Table.GetPkColInfo(); pkColInfo != nil {
-			unsignedIntHandle = mysql.HasUnsignedFlag(pkColInfo.Flag)
+			unsignedIntHandle = mysql.HasUnsignedFlag(pkColInfo.GetFlag())
 		}
 	}
 	for _, ran := range p.Ranges {
@@ -465,12 +465,6 @@ func (p *PhysicalIndexLookUpReader) ExplainInfo() string {
 		str.WriteString(", count:")
 		str.WriteString(strconv.FormatUint(p.PushedLimit.Count, 10))
 		str.WriteString(")")
-	}
-	if p.Paging {
-		if p.PushedLimit != nil {
-			str.WriteString(", ")
-		}
-		str.WriteString("paging:true")
 	}
 	return str.String()
 }

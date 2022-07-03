@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser/ast"
 	"github.com/pingcap/tidb/parser/auth"
 	"github.com/pingcap/tidb/parser/mysql"
@@ -566,7 +567,7 @@ func (p *MySQLPrivilege) LoadDefaultRoles(ctx sessionctx.Context) error {
 
 func (p *MySQLPrivilege) loadTable(sctx sessionctx.Context, sql string,
 	decodeTableRow func(chunk.Row, []*ast.ResultField) error) error {
-	ctx := context.Background()
+	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnPrivilege)
 	rs, err := sctx.(sqlexec.SQLExecutor).ExecuteInternal(ctx, sql)
 	if err != nil {
 		return errors.Trace(err)
@@ -653,7 +654,7 @@ func (p *MySQLPrivilege) decodeUserTableRow(row chunk.Row, fs []*ast.ResultField
 			} else {
 				value.AuthPlugin = mysql.AuthNativePassword
 			}
-		case f.Column.Tp == mysql.TypeEnum:
+		case f.Column.GetType() == mysql.TypeEnum:
 			if row.GetEnum(i).String() != "Y" {
 				continue
 			}
@@ -734,7 +735,7 @@ func (p *MySQLPrivilege) decodeDBTableRow(row chunk.Row, fs []*ast.ResultField) 
 		case f.ColumnAsName.L == "db":
 			value.DB = row.GetString(i)
 			value.dbPatChars, value.dbPatTypes = stringutil.CompilePatternBytes(strings.ToUpper(value.DB), '\\')
-		case f.Column.Tp == mysql.TypeEnum:
+		case f.Column.GetType() == mysql.TypeEnum:
 			if row.GetEnum(i).String() != "Y" {
 				continue
 			}
@@ -1168,7 +1169,7 @@ func (p *MySQLPrivilege) DBIsVisible(user, host, db string) bool {
 }
 
 func (p *MySQLPrivilege) showGrants(user, host string, roles []*auth.RoleIdentity) []string {
-	var gs []string // nolint: prealloc
+	var gs []string //nolint: prealloc
 	var sortFromIdx int
 	var hasGlobalGrant = false
 	// Some privileges may granted from role inheritance.
