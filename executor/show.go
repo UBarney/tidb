@@ -799,17 +799,6 @@ func (e *ShowExec) fetchShowMasterStatus() error {
 	return nil
 }
 
-func (e *ShowExec) sysVarHiddenForSem(sysVarNameInLower string) bool {
-	if !sem.IsEnabled() || !sem.IsInvisibleSysVar(sysVarNameInLower) {
-		return false
-	}
-	checker := privilege.GetPrivilegeManager(e.ctx)
-	if checker == nil || checker.RequestDynamicVerification(e.ctx.GetSessionVars().ActiveRoles, "RESTRICTED_VARIABLES_ADMIN", false) {
-		return false
-	}
-	return true
-}
-
 func (e *ShowExec) fetchShowVariables() (err error) {
 	var (
 		value       string
@@ -839,7 +828,7 @@ func (e *ShowExec) fetchShowVariables() (err error) {
 				} else if fieldPatternsLike != nil && !fieldPatternsLike.DoMatch(v.Name) {
 					continue
 				}
-				if e.sysVarHiddenForSem(v.Name) {
+				if infoschema.SysVarHiddenForSem(e.ctx, v.Name) {
 					continue
 				}
 				value, err = sessionVars.GetGlobalSystemVar(v.Name)
@@ -864,7 +853,7 @@ func (e *ShowExec) fetchShowVariables() (err error) {
 		} else if fieldPatternsLike != nil && !fieldPatternsLike.DoMatch(v.Name) {
 			continue
 		}
-		if e.sysVarHiddenForSem(v.Name) {
+		if infoschema.SysVarHiddenForSem(e.ctx, v.Name) {
 			continue
 		}
 		value, err = sessionVars.GetSessionOrGlobalSystemVar(v.Name)
@@ -1031,7 +1020,12 @@ func ConstructResultOfShowCreateTable(ctx sessionctx.Context, tableInfo *model.T
 			}
 		}
 		if ddl.IsAutoRandomColumnID(tableInfo, col.ID) {
-			buf.WriteString(fmt.Sprintf(" /*T![auto_rand] AUTO_RANDOM(%d) */", tableInfo.AutoRandomBits))
+			s, r := tableInfo.AutoRandomBits, tableInfo.AutoRandomRangeBits
+			if r == 0 || r == autoid.AutoRandomRangeBitsDefault {
+				buf.WriteString(fmt.Sprintf(" /*T![auto_rand] AUTO_RANDOM(%d) */", s))
+			} else {
+				buf.WriteString(fmt.Sprintf(" /*T![auto_rand] AUTO_RANDOM(%d, %d) */", s, r))
+			}
 		}
 		if len(col.Comment) > 0 {
 			buf.WriteString(fmt.Sprintf(" COMMENT '%s'", format.OutputFormat(col.Comment)))
@@ -1375,39 +1369,7 @@ func appendPartitionInfo(partitionInfo *model.PartitionInfo, buf *bytes.Buffer, 
 		fmt.Fprintf(buf, "\nPARTITION BY %s (%s)\n(", partitionInfo.Type.String(), partitionInfo.Expr)
 	}
 
-	for i, def := range partitionInfo.Definitions {
-		if i > 0 {
-			fmt.Fprintf(buf, ",\n ")
-		}
-		fmt.Fprintf(buf, "PARTITION %s", stringutil.Escape(def.Name.O, sqlMode))
-		// PartitionTypeHash does not have any VALUES definition
-		if partitionInfo.Type == model.PartitionTypeRange {
-			lessThans := strings.Join(def.LessThan, ",")
-			fmt.Fprintf(buf, " VALUES LESS THAN (%s)", lessThans)
-		} else if partitionInfo.Type == model.PartitionTypeList {
-			values := bytes.NewBuffer(nil)
-			for j, inValues := range def.InValues {
-				if j > 0 {
-					values.WriteString(",")
-				}
-				if len(inValues) > 1 {
-					values.WriteString("(")
-					values.WriteString(strings.Join(inValues, ","))
-					values.WriteString(")")
-				} else {
-					values.WriteString(strings.Join(inValues, ","))
-				}
-			}
-			fmt.Fprintf(buf, " VALUES IN (%s)", values.String())
-		}
-		if len(def.Comment) > 0 {
-			buf.WriteString(fmt.Sprintf(" COMMENT '%s'", format.OutputFormat(def.Comment)))
-		}
-		if def.PlacementPolicyRef != nil {
-			// add placement ref info here
-			fmt.Fprintf(buf, " /*T![placement] PLACEMENT POLICY=%s */", stringutil.Escape(def.PlacementPolicyRef.Name.O, sqlMode))
-		}
-	}
+	ddl.AppendPartitionDefs(partitionInfo, buf, sqlMode)
 	buf.WriteString(")")
 }
 
@@ -1791,10 +1753,6 @@ func (e *ShowExec) tableAccessDenied(access string, table string) error {
 
 func (e *ShowExec) appendRow(row []interface{}) {
 	for i, col := range row {
-		if col == nil {
-			e.result.AppendNull(i)
-			continue
-		}
 		switch x := col.(type) {
 		case nil:
 			e.result.AppendNull(i)

@@ -15,11 +15,13 @@
 package core
 
 import (
+	"context"
 	"math"
 	"strconv"
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/parser/ast"
@@ -28,27 +30,167 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
+	driver "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/hack"
+	"github.com/pingcap/tidb/util/hint"
 	"github.com/pingcap/tidb/util/kvcache"
+	"github.com/pingcap/tidb/util/stringutil"
 	atomic2 "go.uber.org/atomic"
+	"golang.org/x/exp/slices"
 )
 
 var (
 	// PreparedPlanCacheMaxMemory stores the max memory size defined in the global config "performance-server-memory-quota".
 	PreparedPlanCacheMaxMemory = *atomic2.NewUint64(math.MaxUint64)
+
+	// ExtractSelectAndNormalizeDigest extract the select statement and normalize it.
+	ExtractSelectAndNormalizeDigest func(stmtNode ast.StmtNode, specifiledDB string) (ast.StmtNode, string, string, error)
 )
 
-// SetPreparedPlanCache sets isEnabled to true, then prepared plan cache is enabled.
-// FIXME: leave it for test, remove it after implementing session-level plan-cache variables.
-func SetPreparedPlanCache(isEnabled bool) {
-	variable.EnablePreparedPlanCache.Store(isEnabled) // only for test
+type paramMarkerExtractor struct {
+	markers []ast.ParamMarkerExpr
 }
 
-// PreparedPlanCacheEnabled returns whether the prepared plan cache is enabled.
-// FIXME: leave it for test, remove it after implementing session-level plan-cache variables.
-func PreparedPlanCacheEnabled() bool {
-	return variable.EnablePreparedPlanCache.Load()
+func (e *paramMarkerExtractor) Enter(in ast.Node) (ast.Node, bool) {
+	return in, false
+}
+
+func (e *paramMarkerExtractor) Leave(in ast.Node) (ast.Node, bool) {
+	if x, ok := in.(*driver.ParamMarkerExpr); ok {
+		e.markers = append(e.markers, x)
+	}
+	return in, true
+}
+
+// GeneratePlanCacheStmtWithAST generates the PlanCacheStmt structure for this AST.
+func GeneratePlanCacheStmtWithAST(ctx context.Context, sctx sessionctx.Context, stmt ast.StmtNode) (*PlanCacheStmt, Plan, int, error) {
+	vars := sctx.GetSessionVars()
+	var extractor paramMarkerExtractor
+	stmt.Accept(&extractor)
+
+	// DDL Statements can not accept parameters
+	if _, ok := stmt.(ast.DDLNode); ok && len(extractor.markers) > 0 {
+		return nil, nil, 0, ErrPrepareDDL
+	}
+
+	switch stmt.(type) {
+	case *ast.LoadDataStmt, *ast.PrepareStmt, *ast.ExecuteStmt, *ast.DeallocateStmt, *ast.NonTransactionalDeleteStmt:
+		return nil, nil, 0, ErrUnsupportedPs
+	}
+
+	// Prepare parameters should NOT over 2 bytes(MaxUint16)
+	// https://dev.mysql.com/doc/internals/en/com-stmt-prepare-response.html#packet-COM_STMT_PREPARE_OK.
+	if len(extractor.markers) > math.MaxUint16 {
+		return nil, nil, 0, ErrPsManyParam
+	}
+
+	ret := &PreprocessorReturn{}
+	err := Preprocess(sctx, stmt, InPrepare, WithPreprocessorReturn(ret))
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	// The parameter markers are appended in visiting order, which may not
+	// be the same as the position order in the query string. We need to
+	// sort it by position.
+	slices.SortFunc(extractor.markers, func(i, j ast.ParamMarkerExpr) bool {
+		return i.(*driver.ParamMarkerExpr).Offset < j.(*driver.ParamMarkerExpr).Offset
+	})
+	ParamCount := len(extractor.markers)
+	for i := 0; i < ParamCount; i++ {
+		extractor.markers[i].SetOrder(i)
+	}
+
+	prepared := &ast.Prepared{
+		Stmt:          stmt,
+		StmtType:      ast.GetStmtLabel(stmt),
+		Params:        extractor.markers,
+		SchemaVersion: ret.InfoSchema.SchemaMetaVersion(),
+	}
+	normalizedSQL, digest := parser.NormalizeDigest(prepared.Stmt.Text())
+
+	var (
+		normalizedSQL4PC, digest4PC string
+		selectStmtNode              ast.StmtNode
+	)
+	if !vars.EnablePreparedPlanCache {
+		prepared.UseCache = false
+	} else {
+		prepared.UseCache = CacheableWithCtx(sctx, stmt, ret.InfoSchema)
+		selectStmtNode, normalizedSQL4PC, digest4PC, err = ExtractSelectAndNormalizeDigest(stmt, vars.CurrentDB)
+		if err != nil || selectStmtNode == nil {
+			normalizedSQL4PC = ""
+			digest4PC = ""
+		}
+	}
+
+	// We try to build the real statement of preparedStmt.
+	for i := range prepared.Params {
+		param := prepared.Params[i].(*driver.ParamMarkerExpr)
+		param.Datum.SetNull()
+		param.InExecute = false
+	}
+
+	var p Plan
+	destBuilder, _ := NewPlanBuilder().Init(sctx, ret.InfoSchema, &hint.BlockHintProcessor{})
+	p, err = destBuilder.Build(ctx, stmt)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	preparedObj := &PlanCacheStmt{
+		PreparedAst:         prepared,
+		StmtDB:              vars.CurrentDB,
+		StmtText:            stmt.Text(),
+		VisitInfos:          destBuilder.GetVisitInfo(),
+		NormalizedSQL:       normalizedSQL,
+		SQLDigest:           digest,
+		ForUpdateRead:       destBuilder.GetIsForUpdateRead(),
+		SnapshotTSEvaluator: ret.SnapshotTSEvaluator,
+		NormalizedSQL4PC:    normalizedSQL4PC,
+		SQLDigest4PC:        digest4PC,
+	}
+	if err = CheckPreparedPriv(sctx, preparedObj, ret.InfoSchema); err != nil {
+		return nil, nil, 0, err
+	}
+	return preparedObj, p, ParamCount, nil
+}
+
+func getValidPlanFromCache(sctx sessionctx.Context, isGeneralPlanCache bool, key kvcache.Key, paramTypes []*types.FieldType) (*PlanCacheValue, bool) {
+	cache := sctx.GetPlanCache(isGeneralPlanCache)
+	val, exist := cache.Get(key)
+	if !exist {
+		return nil, exist
+	}
+	candidates := val.([]*PlanCacheValue)
+	for _, candidate := range candidates {
+		if candidate.varTypesUnchanged(paramTypes) {
+			return candidate, true
+		}
+	}
+	return nil, false
+}
+
+func putPlanIntoCache(sctx sessionctx.Context, isGeneralPlanCache bool, key kvcache.Key, plan *PlanCacheValue) {
+	cache := sctx.GetPlanCache(isGeneralPlanCache)
+	val, exist := cache.Get(key)
+	if !exist {
+		cache.Put(key, []*PlanCacheValue{plan})
+		return
+	}
+	candidates := val.([]*PlanCacheValue)
+	for i, candidate := range candidates {
+		if candidate.varTypesUnchanged(plan.ParamTypes) {
+			// hit an existing cached plan
+			candidates[i] = plan
+			return
+		}
+	}
+	// add to current candidate list
+	// TODO: limit the candidate list length
+	candidates = append(candidates, plan)
+	cache.Put(key, candidates)
 }
 
 // planCacheKey is used to access Plan Cache. We put some variables that do not affect the plan into planCacheKey, such as the sql text.
@@ -169,7 +311,7 @@ func NewPlanCacheKey(sessionVars *variable.SessionVars, stmtText, stmtDB string,
 }
 
 // FieldSlice is the slice of the types.FieldType
-type FieldSlice []types.FieldType
+type FieldSlice []*types.FieldType
 
 // CheckTypesCompatibility4PC compares FieldSlice with []*types.FieldType
 // Currently this is only used in plan cache to check whether the types of parameters are compatible.
@@ -205,34 +347,34 @@ type PlanCacheValue struct {
 	Plan              Plan
 	OutPutNames       []*types.FieldName
 	TblInfo2UnionScan map[*model.TableInfo]bool
-	TxtVarTypes       FieldSlice
+	ParamTypes        FieldSlice
 }
 
 func (v *PlanCacheValue) varTypesUnchanged(txtVarTps []*types.FieldType) bool {
-	return v.TxtVarTypes.CheckTypesCompatibility4PC(txtVarTps)
+	return v.ParamTypes.CheckTypesCompatibility4PC(txtVarTps)
 }
 
 // NewPlanCacheValue creates a SQLCacheValue.
 func NewPlanCacheValue(plan Plan, names []*types.FieldName, srcMap map[*model.TableInfo]bool,
-	txtVarTps []*types.FieldType) *PlanCacheValue {
+	paramTypes []*types.FieldType) *PlanCacheValue {
 	dstMap := make(map[*model.TableInfo]bool)
 	for k, v := range srcMap {
 		dstMap[k] = v
 	}
-	userVarTypes := make([]types.FieldType, len(txtVarTps))
-	for i, tp := range txtVarTps {
-		userVarTypes[i] = *tp
+	userParamTypes := make([]*types.FieldType, len(paramTypes))
+	for i, tp := range paramTypes {
+		userParamTypes[i] = tp.Clone()
 	}
 	return &PlanCacheValue{
 		Plan:              plan,
 		OutPutNames:       names,
 		TblInfo2UnionScan: dstMap,
-		TxtVarTypes:       userVarTypes,
+		ParamTypes:        userParamTypes,
 	}
 }
 
-// CachedPrepareStmt store prepared ast from PrepareExec and other related fields
-type CachedPrepareStmt struct {
+// PlanCacheStmt store prepared ast from PrepareExec and other related fields
+type PlanCacheStmt struct {
 	PreparedAst         *ast.Prepared
 	StmtDB              string // which DB the statement will be processed over
 	VisitInfos          []visitInfo
@@ -256,20 +398,36 @@ type CachedPrepareStmt struct {
 }
 
 // GetPreparedStmt extract the prepared statement from the execute statement.
-func GetPreparedStmt(stmt *ast.ExecuteStmt, vars *variable.SessionVars) (*CachedPrepareStmt, error) {
-	var ok bool
-	execID := stmt.ExecID
-	if stmt.Name != "" {
-		if execID, ok = vars.PreparedStmtNameToID[stmt.Name]; !ok {
-			return nil, ErrStmtNotFound
-		}
+func GetPreparedStmt(stmt *ast.ExecuteStmt, vars *variable.SessionVars) (*PlanCacheStmt, error) {
+	if stmt.PrepStmt != nil {
+		return stmt.PrepStmt.(*PlanCacheStmt), nil
 	}
-	if preparedPointer, ok := vars.PreparedStmts[execID]; ok {
-		preparedObj, ok := preparedPointer.(*CachedPrepareStmt)
-		if !ok {
-			return nil, errors.Errorf("invalid CachedPrepareStmt type")
+	if stmt.Name != "" {
+		prepStmt, err := vars.GetPreparedStmtByName(stmt.Name)
+		if err != nil {
+			return nil, err
 		}
-		return preparedObj, nil
+		stmt.PrepStmt = prepStmt
+		return prepStmt.(*PlanCacheStmt), nil
 	}
 	return nil, ErrStmtNotFound
+}
+
+// Parameterizer used to parameterize a general statement.
+// e.g. 'select * from t where a>23' --> 'select * from t where a>?' + 23
+type Parameterizer interface {
+	// Parameterize this specific sql, ok indicates whether this sql is supported.
+	Parameterize(originSQL string) (paramSQL string, params []expression.Expression, ok bool, err error)
+}
+
+// ParameterizerKey is used to get a parameterizer from a ctx, only for test.
+const ParameterizerKey = stringutil.StringerStr("parameterizerKey")
+
+// Parameterize parameterizes this sql, used by general plan cache.
+func Parameterize(sctx sessionctx.Context, originSQL string) (paramSQL string, params []expression.Expression, ok bool, err error) {
+	if v := sctx.Value(ParameterizerKey); v != nil { // for test
+		return v.(Parameterizer).Parameterize(originSQL)
+	}
+	// TODO: implement it
+	return "", nil, false, nil
 }
