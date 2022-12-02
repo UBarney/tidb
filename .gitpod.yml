@@ -9,7 +9,12 @@ tasks:
   - name: "installMysqlClient"
     command: sudo apt update && sudo apt install -y mysql-client
 
-  - init: make server
+  - name: build
+    command: |
+      mkdir /workspace/GOCACHE
+      go env -w GOCACHE=/workspace/GOCACHE
+      make server
+      
   
 
 
